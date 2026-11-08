@@ -1,0 +1,555 @@
+"""Données, indicateurs et alertes (sans interface Streamlit), partagés par app.py et auto_alert.py."""
+import hmac
+import os
+import requests
+import datetime
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import streamlit as st
+import yfinance as yf
+import resend
+
+
+# ----------------------------------------------------------------------------
+# Univers
+# ----------------------------------------------------------------------------
+WATCHLIST_STOCKS = {
+    "Tech": ["NVDA", "MSFT", "AAPL"],
+    "Value/Dividendes": ["JNJ", "KO", "PG", "O", "PEP"],
+    "Eau": ["AWAT.PA", "XYL", "AWK"],
+    "Terres Rares": ["REMX", "ALB"]
+}
+
+WATCHLIST_CRYPTO = {
+    "SOL": ("solana", "SOL-USD"),
+    "AVAX": ("avalanche-2", "AVAX-USD"),
+    "LINK": ("chainlink", "LINK-USD"),
+    "ONDO": ("ondo-finance", "ONDO-USD"),
+    "FET": ("fetch-ai", "FET-USD"),
+    "ARB": ("arbitrum", "ARB-USD"),
+}
+PEA_LINES = ["MSCI Europe", "Nasdaq 100", "MSCI Emerging Markets", "Veolia"]
+CRYPTO_LINES = ["ETH", "XRP", "TRX"]
+DEFAULT_TARGETS = {"MSCI Europe": 30, "Nasdaq 100": 30, "MSCI Emerging Markets": 20, "Veolia": 20}
+
+POSITIONS = {
+    "MSCI Europe": {"ticker": "PCEU.PA", "qty": 15, "target_eur": 584.55},
+    "Nasdaq 100": {"ticker": "PUST.PA", "qty": 6, "target_eur": 654.72},
+    "MSCI Emerging Markets": {"ticker": "PAEEM.PA", "qty": 36},
+    "Veolia": {"ticker": "VIE.PA", "qty": 3, "target_eur": 91.83},
+    "ETH": {"ticker": "ETH-USD", "qty": 1.00785},
+    "XRP": {"ticker": "XRP-USD", "qty": 60.740026},
+    "TRX": {"ticker": "TRX-USD", "qty": 34.790716},
+}
+
+COINGECKO_IDS = {
+    "ETH-USD": "ethereum",
+    "XRP-USD": "ripple",
+    "TRX-USD": "tron",
+}
+
+DCA_DEFAULT_TARGETS = {
+    "MSCI Europe": 35,
+    "Nasdaq 100": 25,
+    "MSCI Emerging Markets": 15,
+    "Veolia": 5,
+    "ETH": 15,
+    "XRP": 2.5,
+    "TRX": 2.5,
+}
+
+RSI_THRESHOLD = 35
+LOOKBACK = 20
+VOLUME_MULT = 2.0
+
+# Indicateurs avancés
+ATR_PERIOD = 14      # période de l'ATR (lissage de Wilder)
+ATR_MULT = 2.0       # Stop-Loss = Prix - ATR_MULT x ATR
+BB_PERIOD = 20       # Bandes de Bollinger
+BB_STD = 2.0
+OBV_LOOKBACK = 20    # fenêtre de comparaison prix / OBV
+
+# ----------------------------------------------------------------------------
+# Configuration Resend (Hardcodée)
+# ----------------------------------------------------------------------------
+def _get_secret(name: str) -> str:
+    """Clé depuis .streamlit/secrets.toml, sinon depuis la variable d'environnement."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name, "")
+
+
+RESEND_API_KEY = _get_secret("RESEND_API_KEY")
+DEST_EMAIL = "wolff.g@sfeir.com"
+HISTORY_FILE = "history.csv"
+
+
+# ----------------------------------------------------------------------------
+# Données
+# ----------------------------------------------------------------------------
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_yf(ticker: str) -> pd.DataFrame:
+    df = yf.Ticker(ticker).history(period="4mo", interval="1d", auto_adjust=True)
+    df = df[["Close", "High", "Volume"]].dropna().tail(60)
+    df.index = df.index.tz_localize(None)
+    return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_coingecko(coin_id: str) -> pd.DataFrame:
+    r = requests.get(
+        f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
+        params={"vs_currency": "eur", "days": 60, "interval": "daily"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+    prices = pd.Series({pd.to_datetime(t, unit="ms"): p for t, p in data["prices"]})
+    vols = pd.Series({pd.to_datetime(t, unit="ms"): v for t, v in data["total_volumes"]})
+    df = pd.DataFrame({"Close": prices, "Volume": vols}).dropna()
+    df["High"] = df["Close"]
+    return df.tail(60)
+
+
+def fetch_crypto(symbol: str) -> pd.DataFrame:
+    coin_id, yf_ticker = WATCHLIST_CRYPTO[symbol]
+    try:
+        return fetch_coingecko(coin_id)
+    except Exception:
+        return fetch_yf(yf_ticker)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def latest_price(ticker: str) -> float:
+    try:
+        return float(fetch_yf(ticker)["Close"].iloc[-1])
+    except Exception:
+        return 0.0
+
+
+def eur_usd_rate() -> float:
+    rate = latest_price("EURUSD=X")
+    return rate if rate > 0 else 1.0
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_crypto_prices_eur() -> dict:
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": ",".join(COINGECKO_IDS.values()), "vs_currencies": "eur"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return {tk: float(data[cg]["eur"]) for tk, cg in COINGECKO_IDS.items() if cg in data}
+    except Exception:
+        return {}
+
+
+def unit_price_eur(line: str) -> float:
+    pos = POSITIONS.get(line)
+    if not pos:
+        return 0.0
+    ticker = pos["ticker"]
+    if line in CRYPTO_LINES:
+        eur_prices = fetch_crypto_prices_eur()
+        if ticker in eur_prices:
+            return eur_prices[ticker]
+        return latest_price(ticker) / eur_usd_rate()
+    return latest_price(ticker)
+
+
+def position_value(line: str) -> float:
+    pos = POSITIONS.get(line)
+    if not pos:
+        return 0.0
+    return pos["qty"] * unit_price_eur(line)
+
+
+# ----------------------------------------------------------------------------
+# Analyse technique & Prix Cibles (Évolution 5)
+# ----------------------------------------------------------------------------
+def rsi(close: pd.Series, n: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+
+
+def calculate_target_price_rsi30(df: pd.DataFrame, target_rsi: float = 30.0) -> float:
+    """Calcule le prix théorique auquel l'actif atteindrait un RSI cible (30)."""
+    if len(df) < 15:
+        return 0.0
+    close = df["Close"]
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    
+    last_gain = gain.iloc[-1]
+    last_loss = loss.iloc[-1]
+    last_close = close.iloc[-1]
+    
+    # Résolution de l'équation du Wilder's Smoothing RSI
+    target_rs = target_rsi / (100 - target_rsi)
+    required_change = (target_rs * (13 * last_loss) - 13 * last_gain) / (1 - target_rs)
+    target_price = last_close + required_change
+    return float(max(target_price, 0.0))
+
+
+# ----------------------------------------------------------------------------
+# Indicateurs avancés : OBV, ATR, Bollinger, MACD, Supports/Résistances
+# ----------------------------------------------------------------------------
+def obv_series(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume : cumul du volume signé par la direction du prix."""
+    direction = np.sign(close.diff()).fillna(0)
+    return (direction * volume).cumsum()
+
+
+OBV_LABELS = {
+    "confirm_up": "🟢 Confirmé",
+    "diverg_down": "🟠 Divergence ↘",
+    "accumulation": "🟡 Accumulation",
+    "confirm_down": "🔴 Faible",
+}
+OBV_HELP = {
+    "🟢 Confirmé": "Prix et OBV montent ensemble : la hausse est soutenue par les volumes.",
+    "🟠 Divergence ↘": "Le prix monte mais l'OBV baisse : hausse peu soutenue, risque d'essoufflement.",
+    "🟡 Accumulation": "Le prix baisse mais l'OBV monte : les volumes entrants suggèrent une accumulation.",
+    "🔴 Faible": "Prix et OBV baissent ensemble : la baisse est confirmée par les volumes.",
+    "—": "Pas assez de données.",
+}
+
+
+def obv_signal(close: pd.Series, obv: pd.Series, lookback: int = OBV_LOOKBACK) -> str:
+    if len(close) <= lookback:
+        return "—"
+    price_chg = float(close.iloc[-1] - close.iloc[-1 - lookback])
+    obv_chg = float(obv.iloc[-1] - obv.iloc[-1 - lookback])
+    if price_chg >= 0:
+        return OBV_LABELS["confirm_up"] if obv_chg >= 0 else OBV_LABELS["diverg_down"]
+    return OBV_LABELS["accumulation"] if obv_chg >= 0 else OBV_LABELS["confirm_down"]
+
+
+def macd_state(hist_now: float, hist_prev: float) -> str:
+    """Lecture de l'histogramme MACD : sa pente anticipe le croisement MACD/Signal."""
+    if hist_now != hist_now or hist_prev != hist_prev:
+        return "—"
+    if hist_now >= 0:
+        return "🟢 Haussier" if hist_now >= hist_prev else "🟠 Essoufflement"
+    return "🟡 Rebond possible" if hist_now > hist_prev else "🔴 Baissier"
+
+
+MACD_HELP = {
+    "🟢 Haussier": "Histogramme positif et croissant : le momentum haussier s'accélère.",
+    "🟠 Essoufflement": "Histogramme positif mais décroissant : la hausse perd de la vitesse (retournement possible).",
+    "🟡 Rebond possible": "Histogramme négatif mais remontant : la baisse s'essouffle, retournement haussier possible.",
+    "🔴 Baissier": "Histogramme négatif et décroissant : le momentum baissier s'accélère.",
+    "—": "Pas assez de données.",
+}
+
+
+def atr_series(df: pd.DataFrame, n: int = ATR_PERIOD) -> pd.Series:
+    """Average True Range (lissage de Wilder)."""
+    prev_close = df["Close"].shift(1)
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - prev_close).abs(),
+        (df["Low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
+
+
+def bollinger(close: pd.Series, n: int = BB_PERIOD, k: float = BB_STD):
+    mid = close.rolling(n).mean()
+    sd = close.rolling(n).std(ddof=0)
+    return mid, mid + k * sd, mid - k * sd
+
+
+def bollinger_label(pct_b: float) -> str:
+    if pct_b != pct_b:
+        return "—"
+    if pct_b > 1:
+        return "🔴 Hors bande haute"
+    if pct_b > 0.8:
+        return "🟠 Près bande haute"
+    if pct_b < 0:
+        return "🟢 Hors bande basse"
+    if pct_b < 0.2:
+        return "🟡 Près bande basse"
+    return "⚪ Zone médiane"
+
+
+def pivot_levels(df: pd.DataFrame, lookback: int = 20) -> dict:
+    """Points pivots classiques calculés sur les `lookback` séances précédentes (≈ pivots mensuels)."""
+    ref = df.iloc[-1 - lookback:-1]
+    if ref.empty:
+        return {}
+    high, low, close = float(ref["High"].max()), float(ref["Low"].min()), float(ref["Close"].iloc[-1])
+    p = (high + low + close) / 3
+    return {
+        "R2": p + (high - low), "R1": 2 * p - low, "Pivot": p,
+        "S1": 2 * p - high, "S2": p - (high - low),
+    }
+
+
+def fib_levels(df: pd.DataFrame, lookback: int = 60) -> dict:
+    """Retracements de Fibonacci sur le dernier mouvement (swing haut / swing bas)."""
+    ref = df.iloc[-lookback:]
+    if ref.empty:
+        return {}
+    high, low = float(ref["High"].max()), float(ref["Low"].min())
+    rng = high - low
+    ratios = {"23.6%": 0.236, "38.2%": 0.382, "50%": 0.5, "61.8%": 0.618, "78.6%": 0.786}
+    uptrend = ref["High"].idxmax() > ref["Low"].idxmin()   # le plus haut est venu après le plus bas
+    levels = {"Plus haut": high, "Plus bas": low}
+    for name, r in ratios.items():
+        levels[f"Fib {name}"] = high - r * rng if uptrend else low + r * rng
+    return levels
+
+
+def nearest_levels(levels: dict, price: float):
+    """Support le plus proche sous le prix, résistance la plus proche au-dessus."""
+    below = {k: v for k, v in levels.items() if v < price}
+    above = {k: v for k, v in levels.items() if v > price}
+    sup = max(below.items(), key=lambda kv: kv[1]) if below else None
+    res = min(above.items(), key=lambda kv: kv[1]) if above else None
+    return sup, res
+
+
+def add_advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ajoute OBV, ATR, Bollinger, MACD et moyennes mobiles à un DataFrame OHLCV."""
+    out = df.copy()
+    out["OBV"] = obv_series(out["Close"], out["Volume"])
+    out["ATR"] = atr_series(out)
+    out["BB_mid"], out["BB_up"], out["BB_low"] = bollinger(out["Close"])
+    out["EMA_12"] = out["Close"].ewm(span=12, adjust=False).mean()
+    out["EMA_26"] = out["Close"].ewm(span=26, adjust=False).mean()
+    out["MACD"] = out["EMA_12"] - out["EMA_26"]
+    out["Signal_Line"] = out["MACD"].ewm(span=9, adjust=False).mean()
+    out["MACD_Hist"] = out["MACD"] - out["Signal_Line"]
+    out["MM50"] = out["Close"].rolling(50).mean()
+    out["MM200"] = out["Close"].rolling(200).mean()
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_ohlcv(ticker: str, period: str = "1y") -> pd.DataFrame:
+    """OHLCV journalier complet (Open/High/Low/Close/Volume).
+
+    Les cryptos cotées en USD sont converties en EUR avec le taux EUR/USD historique,
+    pour rester cohérent avec le reste de l'application.
+    """
+    df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    df.index = pd.DatetimeIndex(df.index).tz_localize(None).normalize()
+    if ticker.endswith("-USD"):
+        fx = yf.Ticker("EURUSD=X").history(period=period, interval="1d")["Close"].dropna()
+        if len(fx):
+            fx.index = pd.DatetimeIndex(fx.index).tz_localize(None).normalize()
+            fx = fx[~fx.index.duplicated(keep="last")]
+            rate = fx.reindex(fx.index.union(df.index)).ffill().bfill().reindex(df.index)
+        else:
+            rate = pd.Series(eur_usd_rate(), index=df.index)
+        df[["Open", "High", "Low", "Close"]] = df[["Open", "High", "Low", "Close"]].div(rate.to_numpy(), axis=0)
+    return df
+
+
+# ----------------------------------------------------------------------------
+# Contexte macro : Fear & Greed (crypto) et prochains résultats (actions)
+# ----------------------------------------------------------------------------
+FNG_FR = {
+    "Extreme Fear": "Peur extrême", "Fear": "Peur", "Neutral": "Neutre",
+    "Greed": "Avidité", "Extreme Greed": "Avidité extrême",
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_fear_greed() -> dict | None:
+    """Crypto Fear & Greed Index (alternative.me), 0 = peur extrême, 100 = avidité extrême."""
+    try:
+        r = requests.get("https://api.alternative.me/fng/", params={"limit": 8}, timeout=10)
+        r.raise_for_status()
+        data = r.json()["data"]
+        return {
+            "value": int(data[0]["value"]),
+            "label": FNG_FR.get(data[0]["value_classification"], data[0]["value_classification"]),
+            "yesterday": int(data[1]["value"]) if len(data) > 1 else None,
+            "week_ago": int(data[-1]["value"]) if len(data) > 1 else None,
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def next_earnings(ticker: str):
+    """Date des prochains résultats (None pour les ETF, cryptos ou si indisponible)."""
+    try:
+        cal = yf.Ticker(ticker).calendar
+        if isinstance(cal, dict):
+            raw = cal.get("Earnings Date", []) or []
+        elif isinstance(cal, pd.DataFrame) and "Earnings Date" in cal.index:
+            raw = list(cal.loc["Earnings Date"].dropna())
+        else:
+            raw = []
+        today = datetime.date.today()
+        future = sorted(d for d in (pd.to_datetime(x).date() for x in raw) if d >= today)
+        return future[0] if future else None
+    except Exception:
+        return None
+
+
+def analyse(df: pd.DataFrame) -> dict | None:
+    if len(df) < LOOKBACK + 2:
+        return None
+        
+    df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+    df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = df['EMA_12'] - df['EMA_26']
+    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
+    
+    last = df.iloc[-1]
+    prev = df.iloc[-1 - LOOKBACK:-1]
+    rsi_now = float(rsi(df["Close"]).iloc[-1])
+    vol_ratio = float(last["Volume"] / prev["Volume"].mean()) if prev["Volume"].mean() > 0 else 0.0
+    high20 = float(prev["High"].max())
+    
+    target_price_rsi30 = calculate_target_price_rsi30(df, 30.0)
+    obv = obv_series(df["Close"], df["Volume"])
+    
+    return {
+        "price": float(last["Close"]),
+        "rsi": rsi_now,
+        "high20": high20,
+        "vol_ratio": vol_ratio,
+        "perf_60d": float(last["Close"] / df["Close"].iloc[0] - 1),
+        "dip": rsi_now < RSI_THRESHOLD,
+        "breakout": bool(last["Close"] > high20 and vol_ratio > VOLUME_MULT),
+        "macd": float(last["MACD"]),
+        "macd_signal": float(last["Signal_Line"]),
+        "macd_hist": float(last["MACD_Hist"]),
+        "target_rsi30": target_price_rsi30,
+        "obv_signal": obv_signal(df["Close"], obv),
+        "macd_state": macd_state(float(last["MACD_Hist"]), float(df["MACD_Hist"].iloc[-2])),
+    }
+
+
+def run_scan() -> tuple[pd.DataFrame, dict]:
+    rows, histories = [], {}
+    jobs = [(t, grp, "Action", fetch_yf) for grp, ts in WATCHLIST_STOCKS.items() for t in ts]
+    jobs += [(s, "Crypto", "Crypto", fetch_crypto) for s in WATCHLIST_CRYPTO]
+    for symbol, group, kind, fetcher in jobs:
+        try:
+            df = fetcher(symbol)
+            res = analyse(df)
+        except Exception:
+            res = None
+        if res is None:
+            continue
+        histories[symbol] = df
+        rows.append({"Actif": symbol, "Univers": group, "Type": kind, **res})
+    return pd.DataFrame(rows), histories
+
+
+# ----------------------------------------------------------------------------
+# Suivi Historique de la Valeur (Évolution 4)
+# ----------------------------------------------------------------------------
+def save_portfolio_snapshot(total_pea: float, total_crypto: float):
+    """Sauvegarde l'historique de la valeur du portefeuille."""
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    total_val = total_pea + total_crypto
+    new_entry = pd.DataFrame([{"Date": today, "PEA": total_pea, "Crypto": total_crypto, "Total": total_val}])
+    
+    if os.path.exists(HISTORY_FILE):
+        hist_df = pd.read_csv(HISTORY_FILE)
+        hist_df = pd.concat([hist_df[hist_df["Date"] != today], new_entry], ignore_index=True)
+    else:
+        hist_df = new_entry
+        
+    hist_df.to_csv(HISTORY_FILE, index=False)
+    return hist_df
+
+
+def load_portfolio_history():
+    if os.path.exists(HISTORY_FILE):
+        return pd.read_csv(HISTORY_FILE)
+    return pd.DataFrame(columns=["Date", "PEA", "Crypto", "Total"])
+
+
+# ----------------------------------------------------------------------------
+# Aide à la décision
+# ----------------------------------------------------------------------------
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_close(ticker: str, period: str = "2y") -> pd.Series:
+    df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
+    close = df["Close"].dropna()
+    close.index = close.index.tz_localize(None)
+    return close
+
+
+def rsi_advice(value: float) -> str:
+    if value < 30: return "🟢 Opportunité (Survente)"
+    if value > 70: return "🔴 Attention (Surachat)"
+    return "⚪ Neutre"
+
+
+def trend_signal(price: float, mm200: float) -> str:
+    if mm200 != mm200: return "—"
+    return "🟢 Tendance Haussière" if price > mm200 else "🔴 Tendance Baissière"
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def decision_table() -> pd.DataFrame:
+    rows = []
+    for line, pos in POSITIONS.items():
+        try:
+            close = fetch_close(pos["ticker"])
+            price = float(close.iloc[-1])
+            rsi_now = float(rsi(close).iloc[-1])
+            mm50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else float("nan")
+            mm200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float("nan")
+            pru = pos.get("pru")
+            if pru and pru > 0:
+                pv = unit_price_eur(line) / pru - 1
+            else:
+                pv = price / float(close.iloc[0]) - 1 if len(close) else float("nan")
+        except Exception:
+            continue
+        rows.append({
+            "Univers": "Crypto" if line in CRYPTO_LINES else "PEA",
+            "Ligne": line, "Ticker": pos["ticker"], "Prix": price,
+            "RSI(14)": rsi_now, "Conseil RSI": rsi_advice(rsi_now),
+            "MM50": mm50, "MM200": mm200, "Tendance": trend_signal(price, mm200),
+            "PV latente": pv,
+        })
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------
+# Envoi d'e-mails (Resend API)
+# ----------------------------------------------------------------------------
+def send_resend_email(subject, body):
+    resend.api_key = RESEND_API_KEY
+    try:
+        resend.Emails.send({
+            "from": "BOURSE APP <onboarding@resend.dev>",
+            "to": DEST_EMAIL,
+            "subject": subject,
+            "text": body,
+        })
+        return True, f"✅ E-mail envoyé avec succès à {DEST_EMAIL} !"
+    except Exception as e:
+        return False, f"❌ Erreur Resend : {e}"
+
+def rsi_alerts(deci: pd.DataFrame) -> list:
+    msgs = []
+    if deci is None or deci.empty: return msgs
+    for _, r in deci.iterrows():
+        val = r["RSI(14)"]
+        if val < 35: msgs.append(f"🟢 {r['Ligne']} ({r['Ticker']}) — Opportunité : RSI {val:.0f} (< 35)")
+        elif val > 75: msgs.append(f"🔴 {r['Ligne']} ({r['Ticker']}) — Surachat : RSI {val:.0f} (> 75)")
+    return msgs

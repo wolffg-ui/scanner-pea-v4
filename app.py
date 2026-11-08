@@ -32,327 +32,9 @@ if not st.session_state.get("authenticated"):
         st.error("Mot de passe incorrect")
     st.stop()
 
-# ----------------------------------------------------------------------------
-# Univers
-# ----------------------------------------------------------------------------
-WATCHLIST_STOCKS = {
-    "Tech": ["NVDA", "MSFT", "AAPL"],
-    "Value/Dividendes": ["JNJ", "KO", "PG", "O", "PEP"],
-    "Eau": ["AWAT.PA", "XYL", "AWK"],
-    "Terres Rares": ["REMX", "ALB"]
-}
+from core import *  # noqa: F401,F403,E402
+from core import _get_secret  # noqa: F401,E402
 
-WATCHLIST_CRYPTO = {
-    "SOL": ("solana", "SOL-USD"),
-    "AVAX": ("avalanche-2", "AVAX-USD"),
-    "LINK": ("chainlink", "LINK-USD"),
-    "ONDO": ("ondo-finance", "ONDO-USD"),
-    "FET": ("fetch-ai", "FET-USD"),
-    "ARB": ("arbitrum", "ARB-USD"),
-}
-PEA_LINES = ["MSCI Europe", "Nasdaq 100", "MSCI Emerging Markets", "Veolia"]
-CRYPTO_LINES = ["ETH", "XRP", "TRX"]
-DEFAULT_TARGETS = {"MSCI Europe": 30, "Nasdaq 100": 30, "MSCI Emerging Markets": 20, "Veolia": 20}
-
-POSITIONS = {
-    "MSCI Europe": {"ticker": "PCEU.PA", "qty": 15, "target_eur": 584.55},
-    "Nasdaq 100": {"ticker": "PUST.PA", "qty": 6, "target_eur": 654.72},
-    "MSCI Emerging Markets": {"ticker": "PAEEM.PA", "qty": 36},
-    "Veolia": {"ticker": "VIE.PA", "qty": 3, "target_eur": 91.83},
-    "ETH": {"ticker": "ETH-USD", "qty": 1.00785},
-    "XRP": {"ticker": "XRP-USD", "qty": 60.740026},
-    "TRX": {"ticker": "TRX-USD", "qty": 34.790716},
-}
-
-COINGECKO_IDS = {
-    "ETH-USD": "ethereum",
-    "XRP-USD": "ripple",
-    "TRX-USD": "tron",
-}
-
-DCA_DEFAULT_TARGETS = {
-    "MSCI Europe": 35,
-    "Nasdaq 100": 25,
-    "MSCI Emerging Markets": 15,
-    "Veolia": 5,
-    "ETH": 15,
-    "XRP": 2.5,
-    "TRX": 2.5,
-}
-
-RSI_THRESHOLD = 35
-LOOKBACK = 20
-VOLUME_MULT = 2.0
-
-# ----------------------------------------------------------------------------
-# Configuration Resend (Hardcodée)
-# ----------------------------------------------------------------------------
-RESEND_API_KEY = st.secrets["RESEND_API_KEY"]
-DEST_EMAIL = "wolff.g@sfeir.com"
-HISTORY_FILE = "history.csv"
-
-
-# ----------------------------------------------------------------------------
-# Données
-# ----------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_yf(ticker: str) -> pd.DataFrame:
-    df = yf.Ticker(ticker).history(period="4mo", interval="1d", auto_adjust=True)
-    df = df[["Close", "High", "Volume"]].dropna().tail(60)
-    df.index = df.index.tz_localize(None)
-    return df
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_coingecko(coin_id: str) -> pd.DataFrame:
-    r = requests.get(
-        f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
-        params={"vs_currency": "eur", "days": 60, "interval": "daily"},
-        timeout=15,
-    )
-    r.raise_for_status()
-    data = r.json()
-    prices = pd.Series({pd.to_datetime(t, unit="ms"): p for t, p in data["prices"]})
-    vols = pd.Series({pd.to_datetime(t, unit="ms"): v for t, v in data["total_volumes"]})
-    df = pd.DataFrame({"Close": prices, "Volume": vols}).dropna()
-    df["High"] = df["Close"]
-    return df.tail(60)
-
-
-def fetch_crypto(symbol: str) -> pd.DataFrame:
-    coin_id, yf_ticker = WATCHLIST_CRYPTO[symbol]
-    try:
-        return fetch_coingecko(coin_id)
-    except Exception:
-        return fetch_yf(yf_ticker)
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def latest_price(ticker: str) -> float:
-    try:
-        return float(fetch_yf(ticker)["Close"].iloc[-1])
-    except Exception:
-        return 0.0
-
-
-def eur_usd_rate() -> float:
-    rate = latest_price("EURUSD=X")
-    return rate if rate > 0 else 1.0
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_crypto_prices_eur() -> dict:
-    try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": ",".join(COINGECKO_IDS.values()), "vs_currencies": "eur"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json()
-        return {tk: float(data[cg]["eur"]) for tk, cg in COINGECKO_IDS.items() if cg in data}
-    except Exception:
-        return {}
-
-
-def unit_price_eur(line: str) -> float:
-    pos = POSITIONS.get(line)
-    if not pos:
-        return 0.0
-    ticker = pos["ticker"]
-    if line in CRYPTO_LINES:
-        eur_prices = fetch_crypto_prices_eur()
-        if ticker in eur_prices:
-            return eur_prices[ticker]
-        return latest_price(ticker) / eur_usd_rate()
-    return latest_price(ticker)
-
-
-def position_value(line: str) -> float:
-    pos = POSITIONS.get(line)
-    if not pos:
-        return 0.0
-    return pos["qty"] * unit_price_eur(line)
-
-
-# ----------------------------------------------------------------------------
-# Analyse technique & Prix Cibles (Évolution 5)
-# ----------------------------------------------------------------------------
-def rsi(close: pd.Series, n: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    return 100 - 100 / (1 + gain / loss.replace(0, np.nan))
-
-
-def calculate_target_price_rsi30(df: pd.DataFrame, target_rsi: float = 30.0) -> float:
-    """Calcule le prix théorique auquel l'actif atteindrait un RSI cible (30)."""
-    if len(df) < 15:
-        return 0.0
-    close = df["Close"]
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    
-    last_gain = gain.iloc[-1]
-    last_loss = loss.iloc[-1]
-    last_close = close.iloc[-1]
-    
-    # Résolution de l'équation du Wilder's Smoothing RSI
-    target_rs = target_rsi / (100 - target_rsi)
-    required_change = (target_rs * (13 * last_loss) - 13 * last_gain) / (1 - target_rs)
-    target_price = last_close + required_change
-    return float(max(target_price, 0.0))
-
-
-def analyse(df: pd.DataFrame) -> dict | None:
-    if len(df) < LOOKBACK + 2:
-        return None
-        
-    df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
-    df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = df['EMA_12'] - df['EMA_26']
-    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['Signal_Line']
-    
-    last = df.iloc[-1]
-    prev = df.iloc[-1 - LOOKBACK:-1]
-    rsi_now = float(rsi(df["Close"]).iloc[-1])
-    vol_ratio = float(last["Volume"] / prev["Volume"].mean()) if prev["Volume"].mean() > 0 else 0.0
-    high20 = float(prev["High"].max())
-    
-    target_price_rsi30 = calculate_target_price_rsi30(df, 30.0)
-    
-    return {
-        "price": float(last["Close"]),
-        "rsi": rsi_now,
-        "high20": high20,
-        "vol_ratio": vol_ratio,
-        "perf_60d": float(last["Close"] / df["Close"].iloc[0] - 1),
-        "dip": rsi_now < RSI_THRESHOLD,
-        "breakout": bool(last["Close"] > high20 and vol_ratio > VOLUME_MULT),
-        "macd": float(last["MACD"]),
-        "macd_signal": float(last["Signal_Line"]),
-        "macd_hist": float(last["MACD_Hist"]),
-        "target_rsi30": target_price_rsi30,
-    }
-
-
-def run_scan() -> tuple[pd.DataFrame, dict]:
-    rows, histories = [], {}
-    jobs = [(t, grp, "Action", fetch_yf) for grp, ts in WATCHLIST_STOCKS.items() for t in ts]
-    jobs += [(s, "Crypto", "Crypto", fetch_crypto) for s in WATCHLIST_CRYPTO]
-    for symbol, group, kind, fetcher in jobs:
-        try:
-            df = fetcher(symbol)
-            res = analyse(df)
-        except Exception:
-            res = None
-        if res is None:
-            continue
-        histories[symbol] = df
-        rows.append({"Actif": symbol, "Univers": group, "Type": kind, **res})
-    return pd.DataFrame(rows), histories
-
-
-# ----------------------------------------------------------------------------
-# Suivi Historique de la Valeur (Évolution 4)
-# ----------------------------------------------------------------------------
-def save_portfolio_snapshot(total_pea: float, total_crypto: float):
-    """Sauvegarde l'historique de la valeur du portefeuille."""
-    today = datetime.date.today().strftime("%Y-%m-%d")
-    total_val = total_pea + total_crypto
-    new_entry = pd.DataFrame([{"Date": today, "PEA": total_pea, "Crypto": total_crypto, "Total": total_val}])
-    
-    if os.path.exists(HISTORY_FILE):
-        hist_df = pd.read_csv(HISTORY_FILE)
-        hist_df = pd.concat([hist_df[hist_df["Date"] != today], new_entry], ignore_index=True)
-    else:
-        hist_df = new_entry
-        
-    hist_df.to_csv(HISTORY_FILE, index=False)
-    return hist_df
-
-
-def load_portfolio_history():
-    if os.path.exists(HISTORY_FILE):
-        return pd.read_csv(HISTORY_FILE)
-    return pd.DataFrame(columns=["Date", "PEA", "Crypto", "Total"])
-
-
-# ----------------------------------------------------------------------------
-# Aide à la décision
-# ----------------------------------------------------------------------------
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_close(ticker: str, period: str = "2y") -> pd.Series:
-    df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
-    close = df["Close"].dropna()
-    close.index = close.index.tz_localize(None)
-    return close
-
-
-def rsi_advice(value: float) -> str:
-    if value < 30: return "🟢 Opportunité (Survente)"
-    if value > 70: return "🔴 Attention (Surachat)"
-    return "⚪ Neutre"
-
-
-def trend_signal(price: float, mm200: float) -> str:
-    if mm200 != mm200: return "—"
-    return "🟢 Tendance Haussière" if price > mm200 else "🔴 Tendance Baissière"
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def decision_table() -> pd.DataFrame:
-    rows = []
-    for line, pos in POSITIONS.items():
-        try:
-            close = fetch_close(pos["ticker"])
-            price = float(close.iloc[-1])
-            rsi_now = float(rsi(close).iloc[-1])
-            mm50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else float("nan")
-            mm200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float("nan")
-            pru = pos.get("pru")
-            if pru and pru > 0:
-                pv = unit_price_eur(line) / pru - 1
-            else:
-                pv = price / float(close.iloc[0]) - 1 if len(close) else float("nan")
-        except Exception:
-            continue
-        rows.append({
-            "Univers": "Crypto" if line in CRYPTO_LINES else "PEA",
-            "Ligne": line, "Ticker": pos["ticker"], "Prix": price,
-            "RSI(14)": rsi_now, "Conseil RSI": rsi_advice(rsi_now),
-            "MM50": mm50, "MM200": mm200, "Tendance": trend_signal(price, mm200),
-            "PV latente": pv,
-        })
-    return pd.DataFrame(rows)
-
-
-# ----------------------------------------------------------------------------
-# Envoi d'e-mails (Resend API)
-# ----------------------------------------------------------------------------
-def send_resend_email(subject, body):
-    resend.api_key = RESEND_API_KEY
-    try:
-        resend.Emails.send({
-            "from": "BOURSE APP <onboarding@resend.dev>",
-            "to": DEST_EMAIL,
-            "subject": subject,
-            "text": body,
-        })
-        return True, f"✅ E-mail envoyé avec succès à {DEST_EMAIL} !"
-    except Exception as e:
-        return False, f"❌ Erreur Resend : {e}"
-
-def rsi_alerts(deci: pd.DataFrame) -> list:
-    msgs = []
-    if deci is None or deci.empty: return msgs
-    for _, r in deci.iterrows():
-        val = r["RSI(14)"]
-        if val < 35: msgs.append(f"🟢 {r['Ligne']} ({r['Ticker']}) — Opportunité : RSI {val:.0f} (< 35)")
-        elif val > 75: msgs.append(f"🔴 {r['Ligne']} ({r['Ticker']}) — Surachat : RSI {val:.0f} (> 75)")
-    return msgs
 
 # ----------------------------------------------------------------------------
 # Allocation & DCA
@@ -439,6 +121,134 @@ def smart_dca_allocate(envelope: float, current: dict, targets: dict, info: dict
 
 
 # ----------------------------------------------------------------------------
+# Analyse approfondie (UI)
+# ----------------------------------------------------------------------------
+# Symboles Yahoo erronés (cotation figée, volume nul) -> symbole valide, pour l'analyse approfondie uniquement.
+YF_ANALYSIS_TICKERS = {"ARB-USD": "ARB11841-USD"}
+
+
+def analysis_universe() -> dict:
+    """Actifs analysables : lignes du portefeuille + watchlist -> (ticker yfinance, type)."""
+    opts = {}
+    for line, pos in POSITIONS.items():
+        opts[f"{line} · portefeuille"] = (pos["ticker"], "Crypto" if line in CRYPTO_LINES else "PEA")
+    for grp, tickers in WATCHLIST_STOCKS.items():
+        for t in tickers:
+            opts[f"{t} · {grp}"] = (t, "Action")
+    for sym, (_, yf_ticker) in WATCHLIST_CRYPTO.items():
+        opts[f"{sym} · watchlist crypto"] = (YF_ANALYSIS_TICKERS.get(yf_ticker, yf_ticker), "Crypto")
+    return opts
+
+
+def render_deep_analysis(ticker: str, kind: str, atr_mult: float, sr_method: str):
+    try:
+        d = add_advanced_columns(fetch_ohlcv(ticker))
+        if len(d) < 60:
+            raise ValueError("historique insuffisant")
+    except Exception as e:
+        st.error(f"Données indisponibles pour {ticker} : {e}")
+        return
+
+    if d["Volume"].tail(10).median() == 0:
+        st.warning(f"⚠️ Les données Yahoo de {ticker} semblent figées (volume nul sur les derniers jours) : "
+                   "ATR, Stop-Loss et niveaux ne sont pas fiables.")
+
+    last, prev = d.iloc[-1], d.iloc[-2]
+    price, atr = float(last["Close"]), float(last["ATR"])
+    stop = price - atr_mult * atr
+    levels = pivot_levels(d) if sr_method == "Points pivots" else fib_levels(d)
+    support, resistance = nearest_levels(levels, price)
+
+    bb_range = float(last["BB_up"] - last["BB_low"])
+    pct_b = float((price - last["BB_low"]) / bb_range) if bb_range > 0 else float("nan")
+    bandwidth = ((d["BB_up"] - d["BB_low"]) / d["BB_mid"]).dropna()
+    squeeze = len(bandwidth) > 30 and bool(bandwidth.iloc[-1] <= bandwidth.tail(120).quantile(0.10))
+    obv_lbl = obv_signal(d["Close"], d["OBV"])
+    hist_now, hist_prev = float(last["MACD_Hist"]), float(prev["MACD_Hist"])
+    macd_lbl = macd_state(hist_now, hist_prev)
+    mm200 = float(last["MM200"])
+
+    # --- Ligne 1 : les 4 lectures clés (une seule étiquette chacune) ---
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Volume · OBV", obv_lbl, help=OBV_HELP[obv_lbl])
+    c2.metric("Volatilité · Bollinger", bollinger_label(pct_b),
+              f"%B = {pct_b:.2f}" if pct_b == pct_b else None, delta_color="off",
+              help="%B = position du prix dans les bandes : 0 = bande basse, 1 = bande haute.")
+    c3.metric("Momentum · MACD", macd_lbl, f"Hist. {hist_now:+.3g}", delta_color="off", help=MACD_HELP[macd_lbl])
+    c4.metric("Tendance · MM200", trend_signal(price, mm200),
+              f"{price / mm200 - 1:+.1%} vs MM200" if mm200 == mm200 else None, delta_color="off")
+    if squeeze:
+        st.info("⚡ Compression des Bandes de Bollinger : la volatilité est à un point bas, un mouvement fort peut se préparer (sans indiquer la direction).")
+
+    # --- Ligne 2 : gestion du risque & niveaux ---
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric(f"🛑 Stop-Loss ({atr_mult:g}×ATR)", f"{stop:,.2f}", f"{stop / price - 1:.1%}", delta_color="off",
+              help=f"Prix − {atr_mult:g} × ATR({ATR_PERIOD}). Un stop trop serré sera touché par le bruit normal du marché.")
+    r2.metric(f"ATR ({ATR_PERIOD}j)", f"{atr:,.2f}", f"{atr / price:.1%} du prix", delta_color="off",
+              help="Amplitude moyenne journalière : mesure de la volatilité.")
+    r3.metric(f"Support ({support[0]})" if support else "Support", f"{support[1]:,.2f}" if support else "—")
+    r4.metric(f"Résistance ({resistance[0]})" if resistance else "Résistance", f"{resistance[1]:,.2f}" if resistance else "—")
+
+    # --- Contexte macro (selon le type d'actif) ---
+    if kind == "Crypto":
+        fg = fetch_fear_greed()
+        if fg:
+            delta = f"{fg['value'] - fg['week_ago']:+d} vs 7 j" if fg["week_ago"] is not None else None
+            st.metric("😨 Fear & Greed (marché crypto)", f"{fg['value']}/100 · {fg['label']}", delta, delta_color="off")
+            if fg["value"] <= 25:
+                st.caption("Peur extrême : zone souvent associée à des phases d'accumulation, mais aussi à une forte volatilité.")
+            elif fg["value"] >= 75:
+                st.caption("Avidité extrême : zone de prudence, les excès de marché se corrigent souvent brutalement.")
+        else:
+            st.caption("Fear & Greed Index indisponible pour le moment.")
+    else:
+        earn = next_earnings(ticker)
+        if earn:
+            days = (earn - datetime.date.today()).days
+            st.metric("📅 Prochains résultats", earn.strftime("%d/%m/%Y"), f"dans {days} j", delta_color="off")
+            if days <= 14:
+                st.warning("Résultats imminents : forte volatilité possible, à garder en tête avant d'acheter ou de placer un stop.")
+        else:
+            st.caption("📅 Pas de date de résultats disponible (ETF ou donnée indisponible).")
+
+    # --- Graphique unique : prix + Bollinger + niveaux / OBV / MACD ---
+    view = d.tail(120)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.55, 0.2, 0.25])
+    fig.add_trace(go.Scatter(x=view.index, y=view["BB_up"], line=dict(width=0), hoverinfo="skip", showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=view.index, y=view["BB_low"], line=dict(width=0), fill="tonexty",
+                             fillcolor="rgba(37,99,235,0.10)", hoverinfo="skip", name="Bollinger"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=view.index, y=view["Close"], mode="lines", name="Prix", line=dict(color="#2563eb", width=2)), row=1, col=1)
+    if view["MM200"].notna().any():
+        fig.add_trace(go.Scatter(x=view.index, y=view["MM200"], mode="lines", name="MM200",
+                                 line=dict(color="#9ca3af", width=1, dash="dash")), row=1, col=1)
+    fig.add_hline(y=stop, line_dash="dash", line_color="#dc2626", annotation_text=f"Stop {stop:,.2f}", row=1, col=1)
+    if support:
+        fig.add_hline(y=support[1], line_dash="dot", line_color="#16a34a", annotation_text=support[0], row=1, col=1)
+    if resistance:
+        fig.add_hline(y=resistance[1], line_dash="dot", line_color="#f59e0b", annotation_text=resistance[0], row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=view.index, y=view["OBV"], mode="lines", name="OBV", line=dict(color="#7c3aed")), row=2, col=1)
+
+    hist_colors = ["#16a34a" if v >= 0 else "#dc2626" for v in view["MACD_Hist"]]
+    fig.add_trace(go.Bar(x=view.index, y=view["MACD_Hist"], marker_color=hist_colors, name="Histogramme"), row=3, col=1)
+    fig.add_trace(go.Scatter(x=view.index, y=view["MACD"], mode="lines", name="MACD", line=dict(color="#2563eb", width=1)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=view.index, y=view["Signal_Line"], mode="lines", name="Signal", line=dict(color="#f97316", width=1)), row=3, col=1)
+
+    fig.update_yaxes(title_text="Prix", row=1, col=1)
+    fig.update_yaxes(title_text="OBV", row=2, col=1)
+    fig.update_yaxes(title_text="MACD", row=3, col=1)
+    fig.update_layout(height=640, margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander(f"Voir tous les niveaux ({sr_method})"):
+        lv = pd.DataFrame({"Niveau": list(levels.keys()), "Prix": list(levels.values())})
+        lv["Écart vs prix"] = lv["Prix"] / price - 1
+        st.dataframe(lv.sort_values("Prix", ascending=False).style.format({"Prix": "{:,.2f}", "Écart vs prix": "{:+.1%}"}),
+                     hide_index=True, use_container_width=True)
+    st.caption("Prix dans la devise de cotation : EUR pour les ETF/actions françaises et les cryptos (converties), USD pour les actions américaines.")
+
+
+# ----------------------------------------------------------------------------
 # Sidebar
 # ----------------------------------------------------------------------------
 with st.sidebar:
@@ -480,8 +290,8 @@ c1.metric("Budget du mois", f"{budget:,.0f} €")
 c2.metric("Enveloppe Cœur PEA", f"{core_env:,.0f} €", f"{core_pct}%")
 c3.metric("Enveloppe Opportunités", f"{opp_env:,.0f} €", f"{100 - core_pct}%")
 
-tab_core, tab_scan, tab_opp, tab_decision, tab_bilan = st.tabs(
-    ["🏛️ Cœur PEA", "🔍 Scanner", "🎯 Opportunités", "🧭 Aide à la décision", "🧾 Bilan & Fiscalité"])
+tab_core, tab_scan, tab_opp, tab_decision, tab_deep, tab_bilan = st.tabs(
+    ["🏛️ Cœur PEA", "🔍 Scanner", "🎯 Opportunités", "🧭 Aide à la décision", "🔬 Analyse approfondie", "🧾 Bilan & Fiscalité"])
 
 with tab_core:
     if sum(targets.values()) == 0:
@@ -542,6 +352,17 @@ with tab_decision:
             hide_index=True, use_container_width=True,
         )
 
+with tab_deep:
+    st.subheader("🔬 Analyse approfondie d'un actif")
+    universe = analysis_universe()
+    sel_col, set_col = st.columns([2, 1])
+    choice = sel_col.selectbox("Actif à analyser", list(universe.keys()))
+    with set_col.expander("⚙️ Réglages"):
+        atr_mult = st.number_input("Multiple d'ATR (Stop-Loss)", min_value=0.5, max_value=5.0, value=ATR_MULT, step=0.5)
+        sr_method = st.radio("Supports / Résistances", ["Points pivots", "Fibonacci"], horizontal=True)
+    deep_ticker, deep_kind = universe[choice]
+    render_deep_analysis(deep_ticker, deep_kind, atr_mult, sr_method)
+
 with tab_bilan:
     st.subheader("🧾 Bilan & Fiscalité")
     
@@ -601,12 +422,14 @@ signals = scan[scan["dip"] | scan["breakout"]]
 
 with tab_scan:
     view = scan.assign(Signal=np.select([scan.dip, scan.breakout], ["🟢 Dip", "🔵 Breakout"], "—"))
-    st.caption("Prix Cible RSI 30 : Cours théorique à atteindre pour placer un ordre d'achat limite en zone d'opportunité.")
+    st.caption("Prix Cible RSI 30 : Cours théorique à atteindre pour placer un ordre d'achat limite en zone d'opportunité. "
+               "Volume (OBV) : le volume confirme-t-il la tendance ? Momentum (MACD) : pente de l'histogramme. "
+               "Détails, Stop-Loss ATR, Bollinger et niveaux clés dans l'onglet 🔬 Analyse approfondie.")
     st.dataframe(
-        view[["Actif", "Univers", "price", "rsi", "target_rsi30", "macd", "macd_signal", "high20", "vol_ratio", "perf_60d", "Signal"]].rename(columns={
-            "price": "Prix", "rsi": "RSI(14)", "target_rsi30": "Prix Cible (RSI 30)", "macd": "MACD", "macd_signal": "Signal MACD", f"high20": f"Plus haut {LOOKBACK}j",
+        view[["Actif", "Univers", "price", "rsi", "target_rsi30", "macd_state", "obv_signal", "high20", "vol_ratio", "perf_60d", "Signal"]].rename(columns={
+            "price": "Prix", "rsi": "RSI(14)", "target_rsi30": "Prix Cible (RSI 30)", "macd_state": "Momentum (MACD)", "obv_signal": "Volume (OBV)", f"high20": f"Plus haut {LOOKBACK}j",
             "vol_ratio": "Volume / moy.", "perf_60d": "Perf 60j"}).style.format({
-            "Prix": "{:,.2f}", "RSI(14)": "{:.1f}", "Prix Cible (RSI 30)": "{:,.2f}", "MACD": "{:.2f}", "Signal MACD": "{:.2f}", f"Plus haut {LOOKBACK}j": "{:,.2f}",
+            "Prix": "{:,.2f}", "RSI(14)": "{:.1f}", "Prix Cible (RSI 30)": "{:,.2f}", f"Plus haut {LOOKBACK}j": "{:,.2f}",
             "Volume / moy.": "{:.2f}×", "Perf 60j": "{:+.1%}"}),
         hide_index=True, use_container_width=True,
     )

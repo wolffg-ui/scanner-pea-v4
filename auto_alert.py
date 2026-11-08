@@ -1,13 +1,13 @@
 """Script d'exécution automatique quotidienne d'alertes."""
 import resend
-from app import run_scan, rsi_alerts, decision_table, RESEND_API_KEY, DEST_EMAIL
+from core import run_scan, rsi_alerts, decision_table, RESEND_API_KEY, DEST_EMAIL
 
 def check_and_send():
     deci = decision_table()
     alerts = rsi_alerts(deci)
     
     scan, _ = run_scan()
-    signals = scan[scan["dip"]]
+    signals = scan[scan["dip"]] if not scan.empty else scan
     
     for _, r in signals.iterrows():
         alerts.append(f"🔥 Signal Opportunité (Dip) sur {r['Actif']} — RSI: {r['rsi']:.1f}, Prix Cible: {r['target_rsi30']:.2f}€")
