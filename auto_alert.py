@@ -12,9 +12,9 @@ import sys
 import resend
 
 from core import (
-    ALERT_RSI_HIGH, ALERT_RSI_LOW, CRYPTO_LINES, DEST_EMAIL, POSITIONS, WATCHLIST_CRYPTO,
+    ALERT_RSI_HIGH, ALERT_RSI_LOW, CRYPTO_LINES, DEST_EMAIL, POSITIONS, SIZING_DEFAULTS, WATCHLIST_CRYPTO,
     WATCHLIST_STOCKS, YF_ANALYSIS_TICKERS, _get_secret, decision_table, fetch_fear_greed,
-    next_earnings, run_scan, signal_snapshot,
+    next_earnings, portfolio_value, run_scan, signal_snapshot, size_signal,
 )
 
 log = logging.getLogger("auto_alert")
@@ -39,7 +39,8 @@ def collect_signals() -> tuple[list, list]:
     deci = decision_table()
     for _, r in deci.iterrows():
         entry = {"name": r["Ligne"], "ticker": r["Ticker"], "rsi": float(r["RSI(14)"]),
-                 "kind": "Crypto" if r["Univers"] == "Crypto" else "PEA"}
+                 "kind": "Crypto" if r["Univers"] == "Crypto" else "PEA",
+                 "pv": (float(r["PV latente"]), float(r["PV (€)"])) if r["PV réelle"] else None}
         if entry["rsi"] < ALERT_RSI_LOW:
             dips.append(entry)
         elif entry["rsi"] > ALERT_RSI_HIGH:
@@ -70,6 +71,8 @@ def enrich(entries: list) -> None:
 def format_line(e: dict, with_target: bool = True) -> str:
     s, t, k = e["snap"], e["ticker"], e["kind"]
     head = f"• {e['name']} ({t}) · RSI {e['rsi']:.0f}"
+    if e.get("pv"):
+        head += f" · PV réelle {e['pv'][0]:+.1%} ({e['pv'][1]:+,.0f} €)".replace(",", " ")
     if not s:
         return head + " · indicateurs avancés indisponibles"
     parts = [head, money(s["price"], t, k)]
@@ -81,6 +84,14 @@ def format_line(e: dict, with_target: bool = True) -> str:
     sup, res = s["support"], s["resistance"]
     parts.append(f"Support {num(sup[1])} ({sup[0]})" if sup else "Support —")
     parts.append(f"Résistance {num(res[1])} ({res[0]})" if res else "Résistance —")
+    sz = e.get("size")
+    if sz is not None:
+        if sz["ok"]:
+            qty = f"{sz['qty']:.0f}" if k != "Crypto" else f"{sz['qty']:.4f}".rstrip("0").rstrip(".")
+            lim = f" ; limité : {sz['limited_by']}" if sz["limited_by"] else ""
+            parts.append(f"Taille : {qty} ≈ {num(sz['amount'])} € (risque {num(sz['risk_eur'])} €{lim})")
+        else:
+            parts.append(f"Taille : n/a ({sz['reason']})")
     return " · ".join(parts)
 
 
@@ -105,6 +116,15 @@ def build_report() -> tuple[str, str, int]:
     dips, overbought = collect_signals()
     enrich(dips)
     enrich(overbought)
+    try:
+        capital = portfolio_value()
+    except Exception as ex:
+        log.warning("Valeur du portefeuille indisponible (%s) : taille de position omise", ex)
+        capital = 0.0
+    for e in dips:
+        if e["snap"]:
+            e["size"] = size_signal(e["snap"], e["ticker"], e["kind"], capital, SIZING_DEFAULTS["risk_pct"],
+                                    SIZING_DEFAULTS["cap_pct"], SIZING_DEFAULTS["budget"])
     confirmed = [e for e in dips if e["snap"] and e["snap"]["dip_confirmed"]]
     watch = [e for e in dips if e not in confirmed]
 
@@ -127,6 +147,8 @@ def build_report() -> tuple[str, str, int]:
         lines += ["⚠️ Résultats à venir", *warnings, ""]
 
     lines.append("Confirmation : OBV 🟢/🟡 ou MACD 🟢/🟡. Stop = prix − 2×ATR(14). Supports/résistances : points pivots.")
+    lines.append(f"Taille : risque {SIZING_DEFAULTS['risk_pct']:g} % du portefeuille ({num(capital)} €), "
+                 f"plafond {SIZING_DEFAULTS['cap_pct']:g} % par ligne, enveloppe {num(SIZING_DEFAULTS['budget'])} € par signal.")
     n = len(dips) + len(overbought)
     return "⚡ Rapport Automatique d'Opportunités Bourse", "\n".join(lines), n
 

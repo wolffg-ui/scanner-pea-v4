@@ -29,6 +29,7 @@ jobs:
       - name: Envoyer l'alerte
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          PORTFOLIO_JSON: ${{ secrets.PORTFOLIO_JSON }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
           if [ "$DRY_RUN" = "true" ]; then python auto_alert.py --dry-run; else python auto_alert.py; fi

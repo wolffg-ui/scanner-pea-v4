@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import backtest
 import yfinance as yf
 import resend
 
@@ -203,6 +204,24 @@ def render_deep_analysis(ticker: str, kind: str, atr_mult: float, sr_method: str
     card(r4, "Résistance la plus proche", f"{resistance[1]:,.2f}{cur}" if resistance else "—",
          f"{resistance[0]} · {abs(resistance[1] / price - 1):.1%} au-dessus du prix. Zone où la hausse a déjà été freinée." if resistance else "Aucun niveau au-dessus du prix.")
 
+    # --- Taille de position selon le risque ---
+    st.markdown("#### Taille de position")
+    sz = size_signal({"price": price, "stop": stop}, ticker, kind, sizing_cfg["capital"], sizing_cfg["risk_pct"],
+                     sizing_cfg["cap_pct"], budget)
+    if sz["ok"]:
+        s1, s2, s3 = st.columns(3)
+        card(s1, "Montant à investir", f"{sz['amount']:,.2f} €", f"Soit {sz['amount'] / sizing_cfg['capital']:.1%} du portefeuille.")
+        card(s2, "Quantité", f"{sz['qty']:,.0f}" if kind != "Crypto" else f"{sz['qty']:,.6f}".rstrip("0").rstrip("."),
+             f"Au prix de {sz['price_eur']:,.2f} € l'unité." + (" Arrondie à l'entier inférieur." if kind != "Crypto" else ""))
+        card(s3, "Risque si le stop est touché", f"{sz['risk_eur']:,.2f} €",
+             f"{sz['risk_eur'] / sizing_cfg['capital']:.2%} du capital (cible : {sizing_cfg['risk_pct']:g} %).")
+        if sz["limited_by"]:
+            st.warning(f"⚠️ Taille limitée ({sz['limited_by']}) : le risque réel est inférieur à la cible.")
+        else:
+            st.caption("Taille fixée par le risque : (capital × risque %) ÷ (prix − Stop-Loss).")
+    else:
+        st.info(f"Taille de position indisponible : {sz['reason']}.")
+
     # --- Contexte macro (selon le type d'actif) ---
     st.markdown("#### Contexte")
     m1, _ = st.columns(2)
@@ -265,6 +284,103 @@ def render_deep_analysis(ticker: str, kind: str, atr_mult: float, sr_method: str
     st.caption("Prix dans la devise de cotation : EUR pour les ETF/actions françaises et les cryptos (converties), USD pour les actions américaines.")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def bt_asset(ticker, rsi_entry, rsi_exit, atr_mult, hold_days, fee):
+    params = backtest.Params(rsi_entry, rsi_exit, atr_mult, hold_days, fee)
+    df = fetch_ohlcv(ticker, "10y")
+    return {"first": df.index[0], "n": len(df), "res": backtest.run_asset(df, params)}
+
+
+def render_backtest_tab():
+    st.subheader("🧪 Backtest de la règle « RSI < seuil »")
+    st.caption("Signal calculé à la clôture du jour J, exécution à l'ouverture de J+1. Historique coupé en deux : "
+               "70 % pour construire, 30 % pour tester hors échantillon.")
+    universe = analysis_universe()
+    defaults = [k for k in universe if k.endswith("· portefeuille")]
+    c1, c2 = st.columns([2, 1])
+    picked = c1.multiselect("Actifs à tester", list(universe.keys()), default=defaults)
+    with c2:
+        exits = st.multiselect("Sorties (la première atteinte ferme la position)",
+                               ["RSI > seuil", "Stop-Loss ATR", "Durée fixe"], default=["RSI > seuil", "Stop-Loss ATR", "Durée fixe"])
+    p1, p2, p3, p4, p5 = st.columns(5)
+    rsi_entry = p1.number_input("RSI d'entrée (<)", 10.0, 50.0, float(RSI_THRESHOLD), step=1.0)
+    rsi_exit = p2.number_input("RSI de sortie (>)", 40.0, 90.0, 50.0, step=1.0, disabled="RSI > seuil" not in exits)
+    atr_mult_bt = p3.number_input("Stop = k × ATR", 0.5, 5.0, float(ATR_MULT), step=0.5, disabled="Stop-Loss ATR" not in exits)
+    hold = p4.number_input("Durée max (jours)", 2, 120, 20, step=1, disabled="Durée fixe" not in exits)
+    fee_pct = p5.number_input("Frais / transaction (%)", 0.0, 2.0, 0.1, step=0.05)
+    st.warning("⚠️ Limites : le passé ne prédit pas l'avenir ; l'historique est court pour certaines cryptos et ETF ; "
+               "les prix sont ajustés des dividendes quand Yahoo les fournit (pas pour tous les actifs) ; "
+               "pas de slippage ni de fiscalité ; une seule position par actif.")
+    if not exits:
+        st.error("Choisis au moins une sortie.")
+        return
+    if st.button("▶️ Lancer le backtest", type="primary") and picked:
+        results, info = {}, {}
+        prog = st.progress(0.0, text="Téléchargement de l'historique…")
+        for i, label in enumerate(picked):
+            ticker = universe[label][0]
+            try:
+                out = bt_asset(ticker, rsi_entry, rsi_exit if "RSI > seuil" in exits else None,
+                               atr_mult_bt if "Stop-Loss ATR" in exits else None,
+                               int(hold) if "Durée fixe" in exits else None, fee_pct / 100)
+                results[ticker] = out["res"]
+                info[ticker] = (out["first"].date(), out["n"])
+            except Exception as e:
+                st.caption(f"⚠️ {ticker} ignoré : {e}")
+            prog.progress((i + 1) / len(picked), text=f"{ticker}")
+        prog.empty()
+        st.session_state["bt"] = {"results": results, "info": info}
+    data = st.session_state.get("bt")
+    if not data or not data["results"]:
+        st.info("Choisis les actifs et les paramètres, puis lance le backtest.")
+        return
+    results, info = data["results"], data["info"]
+    short = {t: v for t, v in info.items() if v[1] < 2000}
+    if short:
+        st.caption("Historique court : " + ", ".join(f"{t} (depuis {d:%m/%Y})" for t, (d, _) in short.items()))
+    agg = backtest.aggregate(results)
+    train_k, test_k = list(agg.keys())[0], list(agg.keys())[-1]
+    fmt = {"Réussite": "{:.0%}", "Gain moyen": "{:+.2%}", "Pire perte": "{:+.1%}", "Temps investi": "{:.0%}",
+           "Max drawdown": "{:.1%}", "Rendement total": "{:+.1%}", "Buy & hold": "{:+.1%}", "B&H drawdown": "{:.1%}"}
+    st.markdown("#### Résultats agrégés (tous les actifs)")
+    for seg in agg:
+        st.markdown(f"**{seg}**")
+        tbl = pd.DataFrame({v: r["stats"] for v, r in agg[seg].items()}).T
+        st.dataframe(tbl.style.format(fmt, na_rep="—"), use_container_width=True)
+    st.markdown("#### Lecture honnête")
+    base_te = agg[test_k]["RSI seul"]["trades"]
+    for v in backtest.VARIANTS:
+        verdict_txt = backtest.verdict(agg[train_k][v]["trades"], agg[test_k][v]["trades"], None if v == "RSI seul" else base_te)
+        st.write(f"**{v}** — {verdict_txt}")
+    st.caption("« Rendement total » agrège des courbes équipondérées mais la stratégie n'est investie qu'une fraction du temps "
+               "(colonne « Temps investi ») : il n'est pas directement comparable au buy & hold. Regarde plutôt le gain moyen par trade, "
+               "le drawdown et la stabilité entre construction et test.")
+    st.markdown("#### Courbe de capital")
+    view = st.selectbox("Vue", ["Agrégé"] + list(results.keys()))
+    source = agg if view == "Agrégé" else results[view]
+    left, right = st.columns(2)
+    colors = {"RSI seul": "#2563eb", "RSI + OBV ou MACD": "#16a34a", "RSI + OBV et MACD": "#f59e0b"}
+    for col, seg in zip((left, right), (train_k, test_k)):
+        if seg not in source:
+            continue
+        fig = go.Figure()
+        for v, r in source[seg].items():
+            fig.add_trace(go.Scatter(x=r["equity"].index, y=r["equity"], name=v, line=dict(color=colors[v], width=1.5)))
+        any_v = next(iter(source[seg].values()))
+        fig.add_trace(go.Scatter(x=any_v["bh"].index, y=any_v["bh"], name="Buy & hold", line=dict(color="#6b7280", dash="dash")))
+        fig.update_layout(title=seg, height=320, margin=dict(l=10, r=10, t=40, b=10), yaxis_title="Capital (départ = 1)",
+                          legend=dict(orientation="h", y=-0.2))
+        if view == "Agrégé":
+            fig.update_yaxes(type="log")
+        col.plotly_chart(fig, use_container_width=True)
+    st.markdown("#### Détail par actif")
+    seg_pick = st.radio("Période", [train_k, test_k], index=1, horizontal=True)
+    var_pick = st.radio("Variante", list(backtest.VARIANTS), horizontal=True)
+    rows = {t: res[seg_pick][var_pick]["stats"] for t, res in results.items() if seg_pick in res}
+    if rows:
+        st.dataframe(pd.DataFrame(rows).T.style.format(fmt, na_rep="—"), use_container_width=True)
+
+
 # ----------------------------------------------------------------------------
 # Sidebar
 # ----------------------------------------------------------------------------
@@ -283,6 +399,17 @@ with st.sidebar:
         st.markdown("**Allocation cible PEA (%)**")
         targets = {n: st.number_input(f"Cible {n}", 0, 100, DEFAULT_TARGETS[n], step=5) for n in PEA_LINES}
         st.form_submit_button("Mettre à jour", use_container_width=True)
+
+    st.divider()
+    st.subheader("📐 Taille de position")
+    portfolio_total = float(sum(pea_values.values()) + sum(crypto_values.values()))
+    auto_capital = st.checkbox("Capital = valeur du portefeuille", value=True)
+    capital_input = st.number_input("Capital total (€)", min_value=0.0, value=float(round(portfolio_total)), step=500.0,
+                                    disabled=auto_capital)
+    risk_pct = st.number_input("Risque max par trade (%)", min_value=0.1, max_value=10.0, value=SIZING_DEFAULTS["risk_pct"], step=0.1)
+    cap_pct = st.number_input("Plafond par ligne (% du portefeuille)", min_value=1.0, max_value=100.0,
+                              value=SIZING_DEFAULTS["cap_pct"], step=1.0)
+    sizing_cfg = {"capital": portfolio_total if auto_capital else capital_input, "risk_pct": risk_pct, "cap_pct": cap_pct}
 
     st.divider()
     st.subheader("📩 Service d'alertes")
@@ -307,8 +434,8 @@ c1.metric("Budget du mois", f"{budget:,.0f} €")
 c2.metric("Enveloppe Cœur PEA", f"{core_env:,.0f} €", f"{core_pct}%")
 c3.metric("Enveloppe Opportunités", f"{opp_env:,.0f} €", f"{100 - core_pct}%")
 
-tab_core, tab_scan, tab_opp, tab_decision, tab_deep, tab_bilan = st.tabs(
-    ["🏛️ Cœur PEA", "🔍 Scanner", "🎯 Opportunités", "🧭 Aide à la décision", "🔬 Analyse approfondie", "🧾 Bilan & Fiscalité"])
+tab_core, tab_scan, tab_opp, tab_decision, tab_deep, tab_bt, tab_bilan = st.tabs(
+    ["🏛️ Cœur PEA", "🔍 Scanner", "🎯 Opportunités", "🧭 Aide à la décision", "🔬 Analyse approfondie", "🧪 Backtest", "🧾 Bilan & Fiscalité"])
 
 with tab_core:
     if sum(targets.values()) == 0:
@@ -339,6 +466,39 @@ with tab_decision:
                 "Prix": "{:,.2f}", "RSI(14)": "{:.1f}", "MM50": "{:,.2f}", "MM200": "{:,.2f}"}),
             hide_index=True, use_container_width=True,
         )
+        st.subheader("💰 Plus-value latente réelle (prix de revient)")
+        known = deci[deci["PV réelle"]]
+        if known.empty:
+            st.info("Aucun prix de revient (PRU) renseigné : la « PV latente » ci-dessous est une estimation sur 2 ans, "
+                    "pas ton gain réel. Renseigne tes PRU dans le formulaire ci-dessous.")
+        else:
+            tot_inv, tot_pv = float(known["Investi (€)"].sum()), float(known["PV (€)"].sum())
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Investi (lignes avec PRU)", f"{tot_inv:,.0f} €")
+            m2.metric("Valeur actuelle", f"{tot_inv + tot_pv:,.0f} €")
+            m3.metric("Plus-value latente totale", f"{tot_pv:+,.0f} €", f"{tot_pv / tot_inv:+.1%}" if tot_inv else None)
+        pv_view = deci[["Ligne", "PRU", "Prix", "PV latente", "PV (€)", "PV réelle"]].copy()
+        pv_view["Base"] = np.where(pv_view["PV réelle"], "Réelle (PRU)", "Estimée (2 ans)")
+        st.dataframe(
+            pv_view[["Ligne", "PRU", "PV latente", "PV (€)", "Base"]].style.format(
+                {"PRU": "{:,.4f}", "PV latente": "{:+.1%}", "PV (€)": "{:+,.2f}"}, na_rep="—"),
+            hide_index=True, use_container_width=True,
+        )
+    with st.expander("✏️ Mes prix de revient (PRU)"):
+        st.caption("PRU en € par unité, frais inclus (à importer depuis l'export Trade Republic avec `python tr_export.py export.csv --write`). "
+                   "Enregistrés dans `portfolio.json`, un fichier local ignoré par git. Sur Streamlit Cloud, ce fichier ne persiste pas : "
+                   "utilise plutôt Settings → Secrets (section `[portfolio]`).")
+        current_costs = load_costs()
+        with st.form("pru_form"):
+            new_costs = {}
+            for ln in POSITIONS:
+                new_costs[ln] = st.number_input(f"PRU {ln} (€)", min_value=0.0, format="%.4f",
+                                                value=float((current_costs.get(ln) or {}).get("pru", 0.0)))
+            if st.form_submit_button("Enregistrer les PRU"):
+                save_costs({k: {"pru": v} for k, v in new_costs.items() if v > 0})
+                apply_costs()
+                decision_table.clear()
+                st.rerun()
     st.divider()
     st.subheader("🛡️ Prise de profit & Sécurisation")
     if not deci.empty:
@@ -346,8 +506,11 @@ with tab_decision:
         secure = deci[(deci["PV latente"] > 0.30) & overheated]
         if secure.empty: st.success("Aucune ligne à sécuriser.")
         else:
-            st.dataframe(secure[["Univers", "Ligne", "Ticker", "Prix", "PV latente", "RSI(14)"]].style.format(
-                    {"Prix": "{:,.2f}", "PV latente": "{:+.1%}", "RSI(14)": "{:.1f}"}), hide_index=True, use_container_width=True)
+            st.dataframe(secure[["Univers", "Ligne", "Ticker", "Prix", "PV latente", "PV (€)", "RSI(14)"]].style.format(
+                    {"Prix": "{:,.2f}", "PV latente": "{:+.1%}", "PV (€)": "{:+,.2f}", "RSI(14)": "{:.1f}"}, na_rep="—"),
+                hide_index=True, use_container_width=True)
+            if not secure["PV réelle"].all():
+                st.caption("⚠️ Pour les lignes sans PRU, la PV est estimée sur 2 ans (pas ton gain réel).")
     st.divider()
     st.subheader("💸 Smart DCA — rebalancement & conseils conditionnels")
     lines = list(POSITIONS.keys())
@@ -379,6 +542,9 @@ with tab_deep:
         sr_method = st.radio("Supports / Résistances", ["Points pivots", "Fibonacci"], horizontal=True)
     deep_ticker, deep_kind = universe[choice]
     render_deep_analysis(deep_ticker, deep_kind, atr_mult, sr_method)
+
+with tab_bt:
+    render_backtest_tab()
 
 with tab_bilan:
     st.subheader("🧾 Bilan & Fiscalité")
@@ -457,6 +623,28 @@ with tab_opp:
         cols = st.columns(len(alloc))
         for col, (_, r) in zip(cols, alloc.iterrows()):
             col.metric(f"{r['Signal']} · {r['Actif']}", f"{r['Montant (€)']:,.0f} €", f"RSI {r['rsi']:.0f} · {r['perf_60d']:+.1%} /60j", delta_color="normal" if r["dip"] else "off")
+
+        # --- Montant plafonné par le risque (taille de position) ---
+        sized_rows = []
+        for _, r in alloc.iterrows():
+            yf_t = WATCHLIST_CRYPTO[r["Actif"]][1] if r["Type"] == "Crypto" else r["Actif"]
+            yf_t = YF_ANALYSIS_TICKERS.get(yf_t, yf_t)
+            try:
+                snap = signal_snapshot(yf_t)
+                sz = size_signal(snap, yf_t, r["Type"], sizing_cfg["capital"], sizing_cfg["risk_pct"], sizing_cfg["cap_pct"], r["Montant (€)"])
+            except Exception as e:
+                sz = {"ok": False, "qty": 0.0, "amount": 0.0, "risk_eur": 0.0, "limited_by": None, "reason": str(e)}
+            sized_rows.append({
+                "Actif": r["Actif"], "Montant proposé (€)": r["Montant (€)"], "Montant retenu (€)": sz["amount"],
+                "Quantité": sz["qty"], "Risque si stop (€)": sz["risk_eur"],
+                "Note": ("Limité : " + sz["limited_by"]) if sz["ok"] and sz["limited_by"] else ("Taille fixée par le risque" if sz["ok"] else sz["reason"]),
+            })
+        st.markdown("**📐 Montant plafonné par le risque**")
+        st.dataframe(pd.DataFrame(sized_rows).style.format(
+            {"Montant proposé (€)": "{:,.0f}", "Montant retenu (€)": "{:,.0f}", "Quantité": "{:,.4f}", "Risque si stop (€)": "{:,.2f}"}),
+            hide_index=True, use_container_width=True)
+        st.caption(f"Risque max {risk_pct:g} % du capital ({sizing_cfg['capital']:,.0f} €) par trade, plafond {cap_pct:g} % par ligne. "
+                   "Actions/ETF : quantité entière ; cryptos : fractions.")
         
         # --- Visualisation Graphique MACD & Hist (Évolution 1) ---
         for _, r in signals.iterrows():

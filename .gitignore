@@ -8,3 +8,10 @@ __pycache__/
 # Secrets Streamlit (ne jamais committer les identifiants réels)
 .streamlit/secrets.toml
 .streamlit/
+
+# Données financières personnelles (ne jamais committer)
+portfolio.json
+Exportation*.csv
+*transactions*.csv
+*.csv
+!tests/data/*.csv

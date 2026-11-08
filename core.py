@@ -1,4 +1,6 @@
 """Données, indicateurs et alertes (sans interface Streamlit), partagés par app.py et auto_alert.py."""
+import json
+import math
 import os
 import requests
 import datetime
@@ -31,6 +33,7 @@ def cached(ttl: float):
                 store[key] = hit
             val = hit[1]
             return val.copy() if hasattr(val, "copy") else val
+        wrapper.clear = store.clear
         return wrapper
     return deco
 
@@ -58,14 +61,61 @@ CRYPTO_LINES = ["ETH", "XRP", "TRX"]
 DEFAULT_TARGETS = {"MSCI Europe": 30, "Nasdaq 100": 30, "MSCI Emerging Markets": 20, "Veolia": 20}
 
 POSITIONS = {
-    "MSCI Europe": {"ticker": "PCEU.PA", "qty": 15, "target_eur": 584.55},
-    "Nasdaq 100": {"ticker": "PUST.PA", "qty": 6, "target_eur": 654.72},
+    "MSCI Europe": {"ticker": "PCEU.PA", "qty": 18, "target_eur": 584.55},
+    "Nasdaq 100": {"ticker": "PUST.PA", "qty": 7, "target_eur": 654.72},
     "MSCI Emerging Markets": {"ticker": "PAEEM.PA", "qty": 36},
-    "Veolia": {"ticker": "VIE.PA", "qty": 3, "target_eur": 91.83},
+    "Veolia": {"ticker": "VIE.PA", "qty": 7, "target_eur": 91.83},
     "ETH": {"ticker": "ETH-USD", "qty": 1.00785},
-    "XRP": {"ticker": "XRP-USD", "qty": 60.740026},
+    "XRP": {"ticker": "XRP-USD", "qty": 80.908713},
     "TRX": {"ticker": "TRX-USD", "qty": 34.790716},
 }
+
+
+# ----------------------------------------------------------------------------
+# Prix de revient (PRU) : données personnelles, jamais dans le code ni dans git.
+# Sources, par ordre de priorité : portfolio.json (local, ignoré par git) -> variable d'environnement
+# PORTFOLIO_JSON (GitHub Actions) -> st.secrets["portfolio"] (Streamlit Cloud).
+# Format : {"MSCI Europe": {"pru": 34.28}, "ETH": {"pru": 2795.2}, ...}
+# ----------------------------------------------------------------------------
+PORTFOLIO_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.json")
+
+
+def load_costs() -> dict:
+    try:
+        with open(PORTFOLIO_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        pass
+    raw = os.environ.get("PORTFOLIO_JSON")
+    if raw:
+        try:
+            return json.loads(raw)
+        except ValueError:
+            log.warning("PORTFOLIO_JSON invalide : ignoré")
+    try:
+        import streamlit as st
+        return {k: dict(v) for k, v in st.secrets["portfolio"].items()}
+    except Exception:
+        return {}
+
+
+def save_costs(costs: dict) -> None:
+    with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
+        json.dump(costs, f, indent=2, ensure_ascii=False)
+
+
+def apply_costs(costs: dict | None = None) -> None:
+    """Injecte les PRU dans POSITIONS (champ « pru » lu par decision_table)."""
+    costs = load_costs() if costs is None else costs
+    for line, pos in POSITIONS.items():
+        pru = (costs.get(line) or {}).get("pru")
+        if pru and float(pru) > 0:
+            pos["pru"] = float(pru)
+        else:
+            pos.pop("pru", None)
+
+
+apply_costs()
 
 COINGECKO_IDS = {
     "ETH-USD": "ethereum",
@@ -543,9 +593,14 @@ def decision_table() -> pd.DataFrame:
             mm200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float("nan")
             pru = pos.get("pru")
             if pru and pru > 0:
-                pv = unit_price_eur(line) / pru - 1
+                unit = unit_price_eur(line)
+                pv = unit / pru - 1
+                pv_eur = pos["qty"] * (unit - pru)
+                invested = pos["qty"] * pru
             else:
-                pv = price / float(close.iloc[0]) - 1 if len(close) else float("nan")
+                pv = price / float(close.iloc[0]) - 1 if len(close) else float("nan")   # estimation sur 2 ans
+                pv_eur = invested = float("nan")
+                pru = float("nan")
         except Exception as e:
             log.warning("Aide à la décision : %s (%s) ignoré (%s)", line, pos["ticker"], e)
             continue
@@ -554,7 +609,8 @@ def decision_table() -> pd.DataFrame:
             "Ligne": line, "Ticker": pos["ticker"], "Prix": price,
             "RSI(14)": rsi_now, "Conseil RSI": rsi_advice(rsi_now),
             "MM50": mm50, "MM200": mm200, "Tendance": trend_signal(price, mm200),
-            "PV latente": pv,
+            "PV latente": pv, "PRU": pru, "PV (€)": pv_eur, "Investi (€)": invested,
+            "PV réelle": invested == invested,
         })
     return pd.DataFrame(rows)
 
@@ -626,3 +682,83 @@ def signal_snapshot(ticker: str, atr_mult: float = ATR_MULT) -> dict:
         "target_rsi30": calculate_target_price_rsi30(d),
         "dip_confirmed": obv_lbl in CONFIRMING_OBV or macd_lbl in CONFIRMING_MACD,
     }
+
+
+# ----------------------------------------------------------------------------
+# Taille de position selon le risque
+# ----------------------------------------------------------------------------
+SIZING_DEFAULTS = {"risk_pct": 1.0, "cap_pct": 20.0, "budget": 200.0}   # budget = enveloppe par signal (e-mail)
+
+
+def position_size(capital: float, risk_pct: float, price: float, stop: float, cap_pct: float,
+                  available: float, integer: bool, current_value: float = 0.0) -> dict:
+    """Quantité = (capital × risque %) / (prix − stop), plafonnée par le plafond de la ligne et l'enveloppe.
+
+    - plafond de la ligne : cap_pct % du capital, moins la valeur déjà détenue sur cette ligne ;
+    - enveloppe : montant disponible à investir (budget) ;
+    - integer=True (actions/ETF) : quantité arrondie à l'entier inférieur ; False (crypto) : fractions permises.
+    Retourne qty, amount, risk_eur, limited_by (None / "plafond par ligne" / "enveloppe disponible"), ok, reason.
+    """
+    res = {"qty": 0.0, "amount": 0.0, "risk_eur": 0.0, "limited_by": None, "ok": False, "reason": ""}
+
+    def bad(msg):
+        res["reason"] = msg
+        return res
+
+    vals = (capital, risk_pct, price, stop, cap_pct, available, current_value)
+    if any(v is None or (isinstance(v, float) and not math.isfinite(v)) for v in vals):
+        return bad("donnée manquante (ATR ou prix indisponible)")
+    if price <= 0:
+        return bad("prix invalide")
+    if capital <= 0:
+        return bad("capital nul")
+    if risk_pct <= 0:
+        return bad("risque par trade nul")
+    if stop >= price:
+        return bad("stop au-dessus du prix (ATR nul ou invalide)")
+    risk_per_unit = price - stop
+    qty = capital * risk_pct / 100 / risk_per_unit
+    room_line = max(cap_pct / 100 * capital - current_value, 0.0)
+    avail = max(available, 0.0)
+    max_amount = min(room_line, avail)
+    if qty * price > max_amount:
+        res["limited_by"] = "plafond par ligne" if room_line < avail else "enveloppe disponible"
+        qty = max_amount / price
+    if integer:
+        qty = math.floor(qty + 1e-9)
+    if qty <= 0:
+        return bad("aucune marge disponible" if max_amount <= 0 else "moins d'un titre dans la limite autorisée")
+    res.update(qty=float(qty), amount=float(qty * price), risk_eur=float(qty * risk_per_unit), ok=True)
+    return res
+
+
+def eur_factor(ticker: str, kind: str) -> float:
+    """Diviseur pour convertir le prix natif en EUR : le taux EUR/USD pour les actions américaines, 1 sinon
+    (ETF/actions françaises en EUR ; cryptos déjà converties par fetch_ohlcv)."""
+    if kind == "Action" and not ticker.endswith(".PA"):
+        return eur_usd_rate()
+    return 1.0
+
+
+def portfolio_value() -> float:
+    """Valeur totale du portefeuille (€) : somme des lignes de POSITIONS."""
+    return float(sum(position_value(line) for line in POSITIONS))
+
+
+def line_for_ticker(ticker: str):
+    for line, pos in POSITIONS.items():
+        if pos["ticker"] == ticker:
+            return line
+    return None
+
+
+def size_signal(snap: dict, ticker: str, kind: str, capital: float, risk_pct: float, cap_pct: float,
+                available: float) -> dict:
+    """position_size appliquée à un instantané (prix, stop) ; conversion en EUR et valeur déjà détenue incluses."""
+    fx = eur_factor(ticker, kind)
+    line = line_for_ticker(ticker)
+    held = position_value(line) if line else 0.0
+    res = position_size(capital, risk_pct, snap["price"] / fx, snap["stop"] / fx, cap_pct, available,
+                        integer=(kind != "Crypto"), current_value=held)
+    res["price_eur"] = snap["price"] / fx
+    return res
