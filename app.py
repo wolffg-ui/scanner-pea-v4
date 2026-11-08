@@ -123,10 +123,6 @@ def smart_dca_allocate(envelope: float, current: dict, targets: dict, info: dict
 # ----------------------------------------------------------------------------
 # Analyse approfondie (UI)
 # ----------------------------------------------------------------------------
-# Symboles Yahoo erronés (cotation figée, volume nul) -> symbole valide, pour l'analyse approfondie uniquement.
-YF_ANALYSIS_TICKERS = {"ARB-USD": "ARB11841-USD"}
-
-
 def analysis_universe() -> dict:
     """Actifs analysables : lignes du portefeuille + watchlist -> (ticker yfinance, type)."""
     opts = {}

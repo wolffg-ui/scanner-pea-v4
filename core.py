@@ -1,15 +1,38 @@
 """Données, indicateurs et alertes (sans interface Streamlit), partagés par app.py et auto_alert.py."""
-import hmac
 import os
 import requests
 import datetime
+import functools
+import logging
+import time
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import streamlit as st
 import yfinance as yf
 import resend
+
+log = logging.getLogger("core")
+
+
+def cached(ttl: float):
+    """Cache mémoire simple avec durée de vie (remplace st.cache_data, sans Streamlit).
+
+    Renvoie des copies des DataFrames/Series pour que l'appelant puisse les modifier.
+    Les exceptions ne sont pas mises en cache.
+    """
+    def deco(fn):
+        store = {}
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            key = (args, tuple(sorted(kwargs.items())))
+            hit = store.get(key)
+            if hit is None or time.time() - hit[0] > ttl:
+                hit = (time.time(), fn(*args, **kwargs))
+                store[key] = hit
+            val = hit[1]
+            return val.copy() if hasattr(val, "copy") else val
+        return wrapper
+    return deco
 
 
 # ----------------------------------------------------------------------------
@@ -75,11 +98,15 @@ OBV_LOOKBACK = 20    # fenêtre de comparaison prix / OBV
 # Configuration Resend (Hardcodée)
 # ----------------------------------------------------------------------------
 def _get_secret(name: str) -> str:
-    """Clé depuis .streamlit/secrets.toml, sinon depuis la variable d'environnement."""
+    """Variable d'environnement d'abord, sinon st.secrets (import paresseux : Streamlit reste optionnel)."""
+    value = os.environ.get(name)
+    if value:
+        return value
     try:
-        return st.secrets[name]
+        import streamlit as st
+        return str(st.secrets[name])
     except Exception:
-        return os.environ.get(name, "")
+        return ""
 
 
 RESEND_API_KEY = _get_secret("RESEND_API_KEY")
@@ -90,7 +117,7 @@ HISTORY_FILE = "history.csv"
 # ----------------------------------------------------------------------------
 # Données
 # ----------------------------------------------------------------------------
-@st.cache_data(ttl=600, show_spinner=False)
+@cached(ttl=600)
 def fetch_yf(ticker: str) -> pd.DataFrame:
     df = yf.Ticker(ticker).history(period="4mo", interval="1d", auto_adjust=True)
     df = df[["Close", "High", "Volume"]].dropna().tail(60)
@@ -98,7 +125,7 @@ def fetch_yf(ticker: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@cached(ttl=1800)
 def fetch_coingecko(coin_id: str) -> pd.DataFrame:
     r = requests.get(
         f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
@@ -122,7 +149,7 @@ def fetch_crypto(symbol: str) -> pd.DataFrame:
         return fetch_yf(yf_ticker)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@cached(ttl=600)
 def latest_price(ticker: str) -> float:
     try:
         return float(fetch_yf(ticker)["Close"].iloc[-1])
@@ -135,7 +162,7 @@ def eur_usd_rate() -> float:
     return rate if rate > 0 else 1.0
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@cached(ttl=600)
 def fetch_crypto_prices_eur() -> dict:
     try:
         r = requests.get(
@@ -336,7 +363,7 @@ def add_advanced_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@cached(ttl=1800)
 def fetch_ohlcv(ticker: str, period: str = "1y") -> pd.DataFrame:
     """OHLCV journalier complet (Open/High/Low/Close/Volume).
 
@@ -367,7 +394,7 @@ FNG_FR = {
 }
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@cached(ttl=3600)
 def fetch_fear_greed() -> dict | None:
     """Crypto Fear & Greed Index (alternative.me), 0 = peur extrême, 100 = avidité extrême."""
     try:
@@ -384,7 +411,7 @@ def fetch_fear_greed() -> dict | None:
         return None
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
+@cached(ttl=6 * 3600)
 def next_earnings(ticker: str):
     """Date des prochains résultats (None pour les ETF, cryptos ou si indisponible)."""
     try:
@@ -446,9 +473,11 @@ def run_scan() -> tuple[pd.DataFrame, dict]:
         try:
             df = fetcher(symbol)
             res = analyse(df)
-        except Exception:
+        except Exception as e:
+            log.warning("Scan : %s ignoré (%s)", symbol, e)
             res = None
         if res is None:
+            log.warning("Scan : %s ignoré (données insuffisantes)", symbol)
             continue
         histories[symbol] = df
         rows.append({"Actif": symbol, "Univers": group, "Type": kind, **res})
@@ -483,7 +512,7 @@ def load_portfolio_history():
 # ----------------------------------------------------------------------------
 # Aide à la décision
 # ----------------------------------------------------------------------------
-@st.cache_data(ttl=1800, show_spinner=False)
+@cached(ttl=1800)
 def fetch_close(ticker: str, period: str = "2y") -> pd.Series:
     df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
     close = df["Close"].dropna()
@@ -502,7 +531,7 @@ def trend_signal(price: float, mm200: float) -> str:
     return "🟢 Tendance Haussière" if price > mm200 else "🔴 Tendance Baissière"
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@cached(ttl=1800)
 def decision_table() -> pd.DataFrame:
     rows = []
     for line, pos in POSITIONS.items():
@@ -517,7 +546,8 @@ def decision_table() -> pd.DataFrame:
                 pv = unit_price_eur(line) / pru - 1
             else:
                 pv = price / float(close.iloc[0]) - 1 if len(close) else float("nan")
-        except Exception:
+        except Exception as e:
+            log.warning("Aide à la décision : %s (%s) ignoré (%s)", line, pos["ticker"], e)
             continue
         rows.append({
             "Univers": "Crypto" if line in CRYPTO_LINES else "PEA",
@@ -545,11 +575,54 @@ def send_resend_email(subject, body):
     except Exception as e:
         return False, f"❌ Erreur Resend : {e}"
 
+ALERT_RSI_LOW = 35    # opportunité
+ALERT_RSI_HIGH = 75   # surachat
+
+
 def rsi_alerts(deci: pd.DataFrame) -> list:
     msgs = []
     if deci is None or deci.empty: return msgs
     for _, r in deci.iterrows():
         val = r["RSI(14)"]
-        if val < 35: msgs.append(f"🟢 {r['Ligne']} ({r['Ticker']}) — Opportunité : RSI {val:.0f} (< 35)")
-        elif val > 75: msgs.append(f"🔴 {r['Ligne']} ({r['Ticker']}) — Surachat : RSI {val:.0f} (> 75)")
+        if val < ALERT_RSI_LOW: msgs.append(f"🟢 {r['Ligne']} ({r['Ticker']}) — Opportunité : RSI {val:.0f} (< 35)")
+        elif val > ALERT_RSI_HIGH: msgs.append(f"🔴 {r['Ligne']} ({r['Ticker']}) — Surachat : RSI {val:.0f} (> 75)")
     return msgs
+
+
+# ----------------------------------------------------------------------------
+# Analyse d'un signal (utilisée par l'e-mail quotidien)
+# ----------------------------------------------------------------------------
+# Symboles Yahoo erronés (cotation figée, volume nul) -> symbole valide, pour l'analyse approfondie.
+YF_ANALYSIS_TICKERS = {"ARB-USD": "ARB11841-USD"}
+
+CONFIRMING_OBV = (OBV_LABELS["confirm_up"], OBV_LABELS["accumulation"])
+CONFIRMING_MACD = ("🟢 Haussier", "🟡 Rebond possible")
+
+
+def signal_snapshot(ticker: str, atr_mult: float = ATR_MULT) -> dict:
+    """Prix, ATR/Stop-Loss, OBV, MACD, support/résistance (pivots) et prix cible RSI 30 d'un actif.
+
+    Lève ValueError si l'historique est insuffisant ou si les données semblent figées.
+    """
+    d = add_advanced_columns(fetch_ohlcv(ticker))
+    if len(d) < 60:
+        raise ValueError("historique insuffisant")
+    if d["Volume"].tail(10).median() == 0:
+        raise ValueError("données figées (volume nul)")
+    last, prev = d.iloc[-1], d.iloc[-2]
+    price, atr = float(last["Close"]), float(last["ATR"])
+    support, resistance = nearest_levels(pivot_levels(d), price)
+    obv_lbl = obv_signal(d["Close"], d["OBV"])
+    macd_lbl = macd_state(float(last["MACD_Hist"]), float(prev["MACD_Hist"]))
+    return {
+        "price": price,
+        "atr": atr,
+        "stop": price - atr_mult * atr,
+        "stop_pct": -atr_mult * atr / price,
+        "obv": obv_lbl,
+        "macd": macd_lbl,
+        "support": support,
+        "resistance": resistance,
+        "target_rsi30": calculate_target_price_rsi30(d),
+        "dip_confirmed": obv_lbl in CONFIRMING_OBV or macd_lbl in CONFIRMING_MACD,
+    }
