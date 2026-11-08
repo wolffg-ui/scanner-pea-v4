@@ -168,33 +168,54 @@ def render_deep_analysis(ticker: str, kind: str, atr_mult: float, sr_method: str
     macd_lbl = macd_state(hist_now, hist_prev)
     mm200 = float(last["MM200"])
 
-    # --- Ligne 1 : les 4 lectures clés (une seule étiquette chacune) ---
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Volume · OBV", obv_lbl, help=OBV_HELP[obv_lbl])
-    c2.metric("Volatilité · Bollinger", bollinger_label(pct_b),
-              f"%B = {pct_b:.2f}" if pct_b == pct_b else None, delta_color="off",
-              help="%B = position du prix dans les bandes : 0 = bande basse, 1 = bande haute.")
-    c3.metric("Momentum · MACD", macd_lbl, f"Hist. {hist_now:+.3g}", delta_color="off", help=MACD_HELP[macd_lbl])
-    c4.metric("Tendance · MM200", trend_signal(price, mm200),
-              f"{price / mm200 - 1:+.1%} vs MM200" if mm200 == mm200 else None, delta_color="off")
+    def card(col, title, value, text, help=None):
+        """Carte lisible : titre, verdict (retour à la ligne autorisé), phrase d'explication."""
+        with col.container(border=True):
+            st.caption(f"**{title}**", help=help)
+            st.markdown(f"**{value}**")
+            st.caption(text)
+
+    cur = " $" if kind == "Action" and not ticker.endswith(".PA") else " €"
+
+    # --- Ligne 1 : l'avis des 4 indicateurs (un verdict + une phrase chacun) ---
+    st.markdown("#### Que disent les indicateurs ?")
+    c1, c2 = st.columns(2)
+    c3, c4 = st.columns(2)
+    card(c1, "Volume (OBV)", obv_lbl, OBV_HELP[obv_lbl],
+         help="L'OBV cumule les volumes échangés les jours de hausse et de baisse : il vérifie que les volumes accompagnent le prix.")
+    card(c2, "Volatilité (Bollinger)", bollinger_label(pct_b),
+         f"Le prix est à {pct_b:.0%} de la fourchette (0 % = bande basse, 100 % = bande haute)." if pct_b == pct_b else "Pas assez de données.")
+    card(c3, "Momentum (MACD)", macd_lbl, MACD_HELP[macd_lbl],
+         help="Pente de l'histogramme MACD : elle change avant les moyennes mobiles, donc anticipe les retournements.")
+    card(c4, "Tendance (MM200)", trend_signal(price, mm200),
+         f"Le prix est {abs(price / mm200 - 1):.1%} {'au-dessus' if price > mm200 else 'en dessous'} de sa moyenne sur 200 jours." if mm200 == mm200 else "Moins de 200 jours d'historique.")
     if squeeze:
         st.info("⚡ Compression des Bandes de Bollinger : la volatilité est à un point bas, un mouvement fort peut se préparer (sans indiquer la direction).")
 
-    # --- Ligne 2 : gestion du risque & niveaux ---
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric(f"🛑 Stop-Loss ({atr_mult:g}×ATR)", f"{stop:,.2f}", f"{stop / price - 1:.1%}", delta_color="off",
-              help=f"Prix − {atr_mult:g} × ATR({ATR_PERIOD}). Un stop trop serré sera touché par le bruit normal du marché.")
-    r2.metric(f"ATR ({ATR_PERIOD}j)", f"{atr:,.2f}", f"{atr / price:.1%} du prix", delta_color="off",
-              help="Amplitude moyenne journalière : mesure de la volatilité.")
-    r3.metric(f"Support ({support[0]})" if support else "Support", f"{support[1]:,.2f}" if support else "—")
-    r4.metric(f"Résistance ({resistance[0]})" if resistance else "Résistance", f"{resistance[1]:,.2f}" if resistance else "—")
+    # --- Ligne 2 : risque et niveaux clés ---
+    st.markdown("#### Risque et niveaux clés")
+    r1, r2 = st.columns(2)
+    r3, r4 = st.columns(2)
+    card(r1, f"🛑 Stop-Loss ({atr_mult:g}×ATR)", f"{stop:,.2f}{cur}",
+         f"Soit {abs(stop / price - 1):.1%} sous le prix actuel. Vendre si le cours descend sous ce niveau limite la perte.",
+         help=f"Prix − {atr_mult:g} × ATR({ATR_PERIOD}). Un stop trop serré sera touché par le bruit normal du marché.")
+    card(r2, f"Volatilité du jour (ATR {ATR_PERIOD}j)", f"{atr:,.2f}{cur}",
+         f"Le cours bouge en moyenne de {atr / price:.1%} par jour.",
+         help="ATR = Average True Range : amplitude moyenne journalière.")
+    card(r3, "Support le plus proche", f"{support[1]:,.2f}{cur}" if support else "—",
+         f"{support[0]} · {abs(support[1] / price - 1):.1%} sous le prix. Zone où la baisse a déjà été freinée." if support else "Aucun niveau sous le prix.")
+    card(r4, "Résistance la plus proche", f"{resistance[1]:,.2f}{cur}" if resistance else "—",
+         f"{resistance[0]} · {abs(resistance[1] / price - 1):.1%} au-dessus du prix. Zone où la hausse a déjà été freinée." if resistance else "Aucun niveau au-dessus du prix.")
 
     # --- Contexte macro (selon le type d'actif) ---
+    st.markdown("#### Contexte")
+    m1, _ = st.columns(2)
     if kind == "Crypto":
         fg = fetch_fear_greed()
         if fg:
-            delta = f"{fg['value'] - fg['week_ago']:+d} vs 7 j" if fg["week_ago"] is not None else None
-            st.metric("😨 Fear & Greed (marché crypto)", f"{fg['value']}/100 · {fg['label']}", delta, delta_color="off")
+            wk = f" Il y a 7 jours : {fg['week_ago']}/100." if fg["week_ago"] is not None else ""
+            card(m1, "😨 Fear & Greed (marché crypto)", f"{fg['value']}/100 · {fg['label']}",
+                 "0 = peur extrême, 100 = avidité extrême." + wk)
             if fg["value"] <= 25:
                 st.caption("Peur extrême : zone souvent associée à des phases d'accumulation, mais aussi à une forte volatilité.")
             elif fg["value"] >= 75:
@@ -205,7 +226,7 @@ def render_deep_analysis(ticker: str, kind: str, atr_mult: float, sr_method: str
         earn = next_earnings(ticker)
         if earn:
             days = (earn - datetime.date.today()).days
-            st.metric("📅 Prochains résultats", earn.strftime("%d/%m/%Y"), f"dans {days} j", delta_color="off")
+            card(m1, "📅 Prochains résultats", earn.strftime("%d/%m/%Y"), f"Dans {days} jours.")
             if days <= 14:
                 st.warning("Résultats imminents : forte volatilité possible, à garder en tête avant d'acheter ou de placer un stop.")
         else:
